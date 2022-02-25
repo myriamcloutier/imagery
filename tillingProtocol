@@ -1,0 +1,228 @@
+---
+title: "Tilling from orthomosaics and annotation"
+author: "Myriam Cloutier & Etienne Laliberté"
+date: "25/02/2022"
+output: html_document
+---
+
+## Import the orthomosaics
+
+```{r}
+library(stars) # library to deal with rasters
+library(tidyverse)
+
+bands_sel <- 1:3 # bands to select (RGB only)
+img <- read_stars("2021-10-07-sbl-cloutier-z2-P4RTK-Terra-UTM18N-Q.tif", # read the GeoTiff
+                  proxy = TRUE) %>%  # import to not load the imagery in memory
+  slice(band, bands_sel) 
+
+plot(img, rgb = 1:3, main = "RGB") # plot RGB orthomosaic (low res version)
+```
+
+## Import the area of interest
+
+The area of interest is a polygon of the area that contains the polygons used for the model.
+It can either be a selection of certain squares of the grid or a polygon covering the zone wanted.
+It has to be exported as a .geojson file.
+
+```{r}
+aoi <- read_sf("GrilleZone2_SelTest1.geojson") %>% 
+  st_transform(st_crs(img))
+
+plot(st_geometry(aoi))
+```
+
+## Import the annotations
+
+The layer containing the annotations has to be exported as a .geojson file.
+
+```{r}
+tree_annot <- read_sf("TemplatePolygone.geojson") %>% 
+  st_transform(st_crs(img))
+
+# then add a numeric ID for the different species / classes, in alphabetical order
+tree_annot <- tree_annot %>%
+  mutate(sp_id = as.numeric(as.factor(Label))) # we keep only one column with species numbers IDs
+
+tree_annot[, c("Label", "sp_id")] # we inspect it
+```
+
+## Get species (and other classes) names
+
+Creates a csv
+
+```{r}
+## Get species (and other classes) names
+# Get species names
+sp_names <- tree_annot %>% 
+  st_drop_geometry() %>% # transform to tibble
+  select(Label, sp_id) %>% # keep only the Label column
+  distinct() %>% # find the unique values
+  arrange(Label) %>% 
+  drop_na()
+sp_names # show the result
+
+write_csv(sp_names, "sp_names.csv")
+```
+
+## Cropping the annotations
+
+```{r}
+sf::sf_use_s2(FALSE) # because getting errors because of s2
+
+species <- tree_annot %>% 
+  st_crop(st_bbox(aoi))
+plot(species["Label"], main = "Classes") # plot the tree polygons
+```
+
+## Create the grid for the tiles
+
+### Find the spatial resolution of the imagery
+
+```{r}
+img_xres <- abs(st_dimensions(img)[[1]]$delta) # x resolution
+img_yres <- abs(st_dimensions(img)[[2]]$delta) # y resolution
+```
+
+### Define the tile size
+
+```{r}
+n_pixels <- 512 # tile size (width/height)
+```
+
+### Create a new raster of coarser resolution
+
+```{r}
+grid_stars <- st_as_stars(st_bbox(img), # empty raster, extent of orthomosaic
+                          dx = img_xres * n_pixels, # x resolution of tiles
+                          dy = img_yres * n_pixels) # y resolution of tiles
+```
+
+### Convert grid to a polygone layer
+
+```{r}
+grid_sf <- st_as_sfc(grid_stars, as_points = FALSE)
+plot(img, rgb = 1:3, reset = FALSE)
+plot(grid_sf, add = TRUE)
+```
+
+## Filter "plots" that should not be used
+
+```{r}
+aoi_sel <- aoi %>% 
+  filter(!is.na(status))
+plot(st_geometry(aoi_sel), reset = FALSE)
+plot(species, add = TRUE)
+```
+
+## Only keep tiles that overlap selected "plots"
+
+```{r}
+tiles_intersect <- st_intersects(grid_sf, aoi_sel)
+sel_logical = lengths(tiles_intersect) > 0 # returns of logical vector for those cells we keep
+grid_sf_sel <- grid_sf[sel_logical] # we filter only those cells
+
+plot(st_geometry(aoi_sel), reset = FALSE)
+plot(grid_sf_sel, border = "red", add = TRUE)
+```
+
+## Extract the tiles and masks
+
+### Preparing for parallel computing
+
+```{r}
+library(foreach)
+library(doParallel)
+n_cores <- detectCores() # we use all cores
+cl <- makeCluster(n_cores) # we start the parallel cluster
+registerDoParallel(cl) # we register it
+clusterExport(cl, "bands_sel") # we need to export that object to all cores
+```
+
+### First loop: list of cropped tiles
+
+```{r}
+# Loop to extract tile locations (as stars_proxy objects)
+tiles_stars_proxy <- foreach(i = 1:length(grid_sf_sel),
+                             .packages = c('tidyverse', 'stars')) %dopar% {
+                               
+                               # Extract tile i from img
+                               tile_i <- img %>% 
+                                 st_crop(grid_sf_sel[i])
+                               
+                             } # end of foreach loop for tile locations
+```
+
+### Second loop: save the RGB tiles
+
+```{r}
+# Second loop: save the RGB tiles
+tiles <- foreach(i = 1:length(tiles_stars_proxy),
+                 .packages = c('tidyverse', 'stars')) %dopar% {
+                   
+                   # Extract tile i
+                   tile_i <- tiles_stars_proxy[[i]] %>% 
+                     # write GeoTiff
+                     write_stars(paste0("tiles/tile_", str_pad(i, 6, pad = "0"), ".tif"),
+                                 type = "Byte",
+                                 options = c("COMPRESS=LZW"))
+                 }
+```
+
+### Third loop: extract the masks
+
+```{r}
+bckgnd_class <- 0
+
+masks <- foreach(i = 1:length(grid_sf_sel),
+                 .packages = c('tidyverse', 'stars')) %dopar% {
+                   
+                   # Extract species cell i from polygon layer             
+                   suppressWarnings(
+                     species_i <- species %>% 
+                       st_intersection(grid_sf_sel[i]) )
+                   
+                   # Create one-band template for rasterization
+                   template <- tiles_stars_proxy[[i]] %>%
+                     st_as_stars() %>% 
+                     slice(band, 1)   
+                   
+                   # Set values to background class
+                   template[[1]][] <- bckgnd_class
+                   
+                   # Rasterize the species vector tile
+                   mask_i <- st_rasterize(species_i[, 'sp_id'], 
+                                          template) %>%
+                     # Export as GeoTiff
+                     write_stars(paste0("masks/tile_", str_pad(i, 6, pad = "0"), "_M.tif"),
+                                 type = "Byte",
+                                 options = c("COMPRESS=LZW"))
+                 } # end foreach loop masks
+
+stopCluster(cl)
+```
+
+### Inspect the tiles and masks
+```{r}
+num <- 314
+tile_num <- read_stars(paste0("tiles/tile_", str_pad(num, 6, pad = "0"), ".tif"))
+plot(tile_num, rgb = 1:3)
+
+mask_num <- read_stars(paste0("masks/tile_", str_pad(num, 6, pad = "0"), "_M.tif"))
+plot(mask_num, useRaster = FALSE)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
